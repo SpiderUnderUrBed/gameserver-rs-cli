@@ -1,0 +1,6 @@
+target/
+db.json
+db.json.old
+.env
+.direnv/
+.history/
