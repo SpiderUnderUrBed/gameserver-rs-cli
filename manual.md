@@ -1,4 +1,6 @@
 # Getting started
+Cli for (gameserver-rs)[https://github.com/SpiderUnderUrBed/gameserver-rs]
+
 Here is how to use the cli to interact with the gameserver node
 
 You can get alot of info from `--help`, especially for all subcommands,
