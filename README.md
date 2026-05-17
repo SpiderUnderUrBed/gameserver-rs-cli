@@ -1,1 +1,1 @@
-Read the (manual)[manual.md]
+Read the [manual.md](manual)
