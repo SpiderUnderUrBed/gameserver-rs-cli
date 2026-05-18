@@ -9,19 +9,23 @@ use futures_util::{SinkExt, StreamExt};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use std::env;
+use tokio::io::AsyncBufReadExt;
 use tokio_tungstenite::{
     connect_async,
     tungstenite::{Message, client::IntoClientRequest, http::Request},
 };
- use tokio::io::AsyncBufReadExt;
 
 use crate::{
-    databasespec::Database,
+    databasespec::{Database, LocalNode, LocalNodeType},
     gameserverspec::{Node, NodeArgs, RetrieveElement, Server, ServerArgs, SettingsArgs, UserArgs},
     jsondatabase::{ensure_db, load_db, save_db},
     types::{ChangeNodeRequest, IncomingMessage, IncomingMessageWithValue},
 };
 use gameserverspec::Settings;
+
+static AUTO_SCHEDULE: bool = true;
+static FORCE_LOCATION_IN_SERVER: bool = false;
+static REQUIRE_SERVER_NAME: bool = false;
 
 #[derive(Debug, Parser)]
 #[command(author, version, about, long_about = None)]
@@ -40,6 +44,8 @@ pub enum Commands {
     Server(ServerCmd),
     CommandSettings(CommandSettingsCmd),
     FsOperation(FsOperationCmd),
+    // #[command(name = "gameserver", next_help_heading = "Presets")]
+    Presets(GameserverCmd),
 }
 
 #[derive(Debug, Args)]
@@ -96,6 +102,12 @@ pub struct UsersCmd {
     pub action: UsersType,
 }
 
+#[derive(Debug, Args)]
+pub struct GameserverCmd {
+    #[clap(subcommand)]
+    pub action: GameserverType,
+}
+
 #[derive(Debug, Subcommand)]
 pub enum FsOperationType {}
 
@@ -115,6 +127,23 @@ pub enum StreamType {
 pub enum CmdSettingsType {
     Set(CommandSettings),
     Get,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum GameserverType {
+    Run(GameserverRunArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct GameserverRunArgs {
+    #[arg(long)]
+    pub file: String,
+    #[arg(long)]
+    pub node: Option<String>,
+    #[arg(long)]
+    pub start_cmd: String,
+    #[arg(long)]
+    pub servername: Option<String>,
 }
 
 #[derive(Debug, Subcommand)]
@@ -195,6 +224,12 @@ struct CommandSettings {
     forward_actions_url: Option<String>,
     #[arg(long)]
     forward_actions: Option<String>,
+    #[arg(
+        long,
+        value_delimiter = ',',
+        help = "comma-separated list of name:path pairs e.g. mynode:/srv/gameserver"
+    )]
+    local_nodes: Option<Vec<String>>,
 }
 
 impl CommandSettings {
@@ -208,7 +243,55 @@ impl CommandSettings {
                 .or(other.external_process_systemd),
             forward_actions_url: self.forward_actions_url.or(other.forward_actions_url),
             forward_actions: self.forward_actions.or(other.forward_actions),
+            local_nodes: self.local_nodes.or(other.local_nodes),
         }
+    }
+
+    pub fn parsed_local_nodes(&self) -> Vec<LocalNode> {
+        self.local_nodes
+            .as_deref()
+            .unwrap_or(&[])
+            .iter()
+            .filter_map(|entry| {
+                let parts: Vec<&str> = entry.splitn(3, ':').collect();
+                let (name, node_type, raw_path) = match parts.as_slice() {
+                    [name, path] => (*name, LocalNodeType::Local, *path),
+                    [name, node_type, path] => {
+                        let node_type = match *node_type {
+                            "local" => LocalNodeType::Local,
+                            other => {
+                                eprintln!("Unknown node type '{}', defaulting to local", other);
+                                LocalNodeType::Local
+                            }
+                        };
+                        (*name, node_type, *path)
+                    }
+                    _ => return None,
+                };
+
+                let expanded = if raw_path.starts_with("~/") {
+                    let home = std::env::var("HOME").unwrap_or_default();
+                    format!("{}/{}", home.trim_end_matches('/'), &raw_path[2..])
+                } else {
+                    raw_path.to_string()
+                };
+
+                let mut path = std::fs::canonicalize(&expanded)
+                    .unwrap_or_else(|_| std::path::PathBuf::from(&expanded))
+                    .to_string_lossy()
+                    .to_string();
+
+                if !path.ends_with("/server") && !path.ends_with("/server/") {
+                    path = format!("{}/server", path.trim_end_matches('/'));
+                }
+
+                Some(LocalNode {
+                    name: name.to_string(),
+                    node_type,
+                    path,
+                })
+            })
+            .collect()
     }
 }
 
@@ -238,6 +321,10 @@ fn auth_header(state: &AppState) -> String {
     )
 }
 
+fn find_node_for_path<'a>(nodes: &'a [LocalNode], file: &str) -> Option<&'a LocalNode> {
+    nodes.iter().find(|n| file.starts_with(&n.path))
+}
+
 #[tokio::main]
 async fn main() {
     let cli = Main::parse();
@@ -247,6 +334,218 @@ async fn main() {
     state.db = load_db();
 
     match cli.command {
+        Some(Commands::Presets(cmd)) => match cmd.action {
+            GameserverType::Run(args) => {
+                if REQUIRE_SERVER_NAME && args.servername.is_none() {
+                    eprintln!("--servername is required when REQUIRE_SERVER_NAME is true");
+                    return;
+                }
+
+                let nodes = state.db.command_settings.parsed_local_nodes();
+
+                let target_node = if AUTO_SCHEDULE {
+                    find_node_for_path(&nodes, &args.file).cloned()
+                } else {
+                    match &args.node {
+                        Some(name) => nodes.iter().find(|n| &n.name == name).cloned(),
+                        None => {
+                            eprintln!("--node is required when AUTO_SCHEDULE is false");
+                            return;
+                        }
+                    }
+                };
+
+                let node = match target_node {
+                    Some(n) => n,
+                    None => {
+                        eprintln!("No local node found for file: {}", args.file);
+                        return;
+                    }
+                };
+
+                if !matches!(node.node_type, LocalNodeType::Local) {
+                    eprintln!(
+                        "Node '{}' is not a local node. Only local nodes are supported for presets run.",
+                        node.name
+                    );
+                    return;
+                }
+
+                if FORCE_LOCATION_IN_SERVER {
+                    let in_any_node = nodes.iter().any(|n| args.file.starts_with(&n.path));
+                    if !in_any_node {
+                        eprintln!(
+                            "FORCE_LOCATION_IN_SERVER is set: file must be inside a local node server directory. Known paths: {}",
+                            nodes
+                                .iter()
+                                .map(|n| n.path.as_str())
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        );
+                        return;
+                    }
+                }
+
+                let server_root = std::fs::canonicalize(std::path::Path::new(&node.path))
+                    .unwrap_or_else(|_| std::path::PathBuf::from(&node.path));
+
+                let file_path = std::fs::canonicalize(&args.file)
+                    .unwrap_or_else(|_| std::path::PathBuf::from(&args.file));
+
+                let servername = args.servername.clone().unwrap_or_else(|| {
+                    file_path
+                        .parent()
+                        .and_then(|p| p.file_name())
+                        .map(|n| n.to_string_lossy().to_string())
+                        .unwrap_or_else(|| "server".to_string())
+                });
+
+                let server_location = servername.clone();
+
+                let file_name = file_path
+                    .file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .to_string();
+
+                let server_dir = server_root.join(&server_location);
+
+                if let Err(e) = std::fs::create_dir_all(&server_dir) {
+                    eprintln!("Failed to create server directory: {}", e);
+                    return;
+                }
+
+                let provider_config = serde_json::json!({
+                    "start": args.start_cmd,
+                    "location": file_name,
+                    "needed_paths": [],
+                    "needed_commands": []
+                });
+
+                let provider_json_path = server_dir.join("provider.json");
+                if let Err(e) = std::fs::write(
+                    &provider_json_path,
+                    serde_json::to_string_pretty(&provider_config).unwrap(),
+                ) {
+                    eprintln!("Failed to write provider.json: {}", e);
+                    return;
+                }
+                println!("Wrote provider.json to {}", provider_json_path.display());
+
+                let file_dest = server_dir.join(&file_name);
+                if file_path != file_dest {
+                    if let Err(e) = std::fs::copy(&args.file, &file_dest) {
+                        eprintln!("Failed to copy file to server directory: {}", e);
+                        return;
+                    }
+                    println!("Copied {} to {}", args.file, file_dest.display());
+                } else {
+                    println!("File already in server directory, skipping copy");
+                }
+
+                let servers_response = client
+                    .get(format!("{}/api/servers", base_url(&state)))
+                    .header("Authorization", auth_header(&state))
+                    .send()
+                    .await;
+
+                let server_exists = match servers_response {
+                    Ok(r) if r.status().is_success() => match r.json::<serde_json::Value>().await {
+                        Ok(body) => body
+                            .as_array()
+                            .map(|arr| {
+                                arr.iter().any(|s| {
+                                    s.get("servername")
+                                        .and_then(|n| n.as_str())
+                                        .map(|n| n == servername)
+                                        .unwrap_or(false)
+                                })
+                            })
+                            .unwrap_or(false),
+                        Err(_) => false,
+                    },
+                    _ => false,
+                };
+
+                if server_exists {
+                    println!("Server '{}' already exists, reusing it", servername);
+                } else {
+                    let create_response = client
+                        .post(format!("{}/api/addserver", base_url(&state)))
+                        .header("Authorization", auth_header(&state))
+                        .json(&serde_json::json!({
+                            "element": {
+                                "kind": "Server",
+                                "data": {
+                                    "servername": servername,
+                                    "provider": "custom",
+                                    "providertype": "",
+                                    "location": server_location,
+                                    "sandbox": false,
+                                    "server_metadata": {}
+                                }
+                            },
+                            "jwt": "",
+                            "require_auth": false
+                        }))
+                        .send()
+                        .await;
+
+                    match create_response {
+                        Ok(r) if r.status().is_success() => {}
+                        Ok(r) if r.status() == 409 => {
+                            println!("Server '{}' already exists (409), reusing it", servername);
+                        }
+                        Ok(r) => {
+                            eprintln!("addserver failed: {}", r.status());
+                            return;
+                        }
+                        Err(e) => {
+                            eprintln!("addserver request failed: {}", e);
+                            return;
+                        }
+                    }
+                }
+
+                let set_response = client
+                    .post(format!("{}/api/setserver", base_url(&state)))
+                    .header("Authorization", auth_header(&state))
+                    .json(&serde_json::json!({
+                        "element": {
+                            "kind": "String",
+                            "data": servername
+                        },
+                        "jwt": "",
+                        "require_auth": false
+                    }))
+                    .send()
+                    .await;
+
+                match set_response {
+                    Ok(r) if r.status().is_success() => {}
+                    Ok(r) => {
+                        eprintln!("setserver failed: {}", r.status());
+                        return;
+                    }
+                    Err(e) => {
+                        eprintln!("setserver request failed: {}", e);
+                        return;
+                    }
+                }
+
+                let start_response = client
+                    .post(format!("{}/api/startserver", base_url(&state)))
+                    .header("Authorization", auth_header(&state))
+                    .send()
+                    .await;
+
+                match start_response {
+                    Ok(r) if r.status().is_success() => println!("Server started"),
+                    Ok(r) => eprintln!("startserver failed: {}", r.status()),
+                    Err(e) => eprintln!("startserver request failed: {}", e),
+                }
+            }
+        },
         Some(Commands::Settings(cmd)) => match cmd.action {
             SettingsType::Set(args) => {
                 let response = client
@@ -658,7 +957,10 @@ async fn main() {
 
                 if let Some(ref service) = output_systemd {
                     if unsafe { libc::getuid() } != 0 {
-                        eprintln!("warning: not running as root, journalctl may not be able to read the journal for '{}'", service);
+                        eprintln!(
+                            "warning: not running as root, journalctl may not be able to read the journal for '{}'",
+                            service
+                        );
                     }
                     let service = service.clone();
                     tokio::spawn(async move {

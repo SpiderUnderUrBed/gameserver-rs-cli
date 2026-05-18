@@ -4,3 +4,4 @@ db.json.old
 .env
 .direnv/
 .history/
+server.jar
