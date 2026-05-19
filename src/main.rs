@@ -23,9 +23,17 @@ use crate::{
 };
 use gameserverspec::Settings;
 
-static AUTO_SCHEDULE: bool = true;
+#[derive(Debug, Clone, PartialEq)]
+pub enum AutoSchedule {
+    ByPath,
+    Manual,
+    ByAvailability,
+}
+
+static AUTO_SCHEDULE: AutoSchedule = AutoSchedule::ByAvailability;
 static FORCE_LOCATION_IN_SERVER: bool = false;
 static REQUIRE_SERVER_NAME: bool = false;
+static USES_CWD_AS_SERVERNAME: bool = true;
 
 #[derive(Debug, Parser)]
 #[command(author, version, about, long_about = None)]
@@ -137,7 +145,7 @@ pub enum GameserverType {
 #[derive(Debug, Args)]
 pub struct GameserverRunArgs {
     #[arg(long)]
-    pub file: String,
+    pub file: Option<String>,
     #[arg(long)]
     pub node: Option<String>,
     #[arg(long)]
@@ -336,21 +344,156 @@ async fn main() {
     match cli.command {
         Some(Commands::Presets(cmd)) => match cmd.action {
             GameserverType::Run(args) => {
-                if REQUIRE_SERVER_NAME && args.servername.is_none() {
+                if REQUIRE_SERVER_NAME && args.servername.is_none() && !USES_CWD_AS_SERVERNAME {
                     eprintln!("--servername is required when REQUIRE_SERVER_NAME is true");
                     return;
                 }
 
                 let nodes = state.db.command_settings.parsed_local_nodes();
 
-                let target_node = if AUTO_SCHEDULE {
-                    find_node_for_path(&nodes, &args.file).cloned()
+                let file = args.file.clone().unwrap_or_else(|| {
+                    std::env::current_dir()
+                        .ok()
+                        .map(|p| p.to_string_lossy().to_string())
+                        .unwrap_or_default()
+                });
+
+                let servername = if USES_CWD_AS_SERVERNAME && args.servername.is_none() {
+                    std::env::current_dir()
+                        .ok()
+                        .and_then(|p| p.file_name().map(|n| n.to_string_lossy().to_string()))
+                        .unwrap_or_else(|| "server".to_string())
                 } else {
-                    match &args.node {
+                    args.servername.clone().unwrap_or_else(|| {
+                        let file_path = std::fs::canonicalize(&file)
+                            .unwrap_or_else(|_| std::path::PathBuf::from(&file));
+                        file_path
+                            .parent()
+                            .and_then(|p| p.file_name())
+                            .map(|n| n.to_string_lossy().to_string())
+                            .unwrap_or_else(|| "server".to_string())
+                    })
+                };
+
+                let target_node = match &AUTO_SCHEDULE {
+                    AutoSchedule::ByPath => find_node_for_path(&nodes, &file).cloned(),
+                    AutoSchedule::Manual => match &args.node {
                         Some(name) => nodes.iter().find(|n| &n.name == name).cloned(),
                         None => {
-                            eprintln!("--node is required when AUTO_SCHEDULE is false");
+                            eprintln!("--node is required when AUTO_SCHEDULE is Manual");
                             return;
+                        }
+                    },
+                    AutoSchedule::ByAvailability => {
+                        let get_settings_resp = client
+                            .get(format!("{}/api/getsettings", base_url(&state)))
+                            .header("Authorization", auth_header(&state))
+                            .send()
+                            .await;
+
+                        if let Ok(r) = get_settings_resp {
+                            if r.status().is_success() {
+                                if let Ok(body) = r.json::<Settings>().await {
+                                    let mut updated = serde_json::to_value(&body).unwrap_or_default();
+                                    if let Some(obj) = updated.as_object_mut() {
+                                        obj.insert(
+                                            "status_type".to_string(),
+                                            serde_json::json!("server-process"),
+                                        );
+                                    }
+                                    let _ = client
+                                        .post(format!("{}/api/setsettings", base_url(&state)))
+                                        .header("Authorization", auth_header(&state))
+                                        .json(&IncomingMessageWithValue {
+                                            message: updated,
+                                            message_type: String::new(),
+                                            authcode: String::new(),
+                                        })
+                                        .send()
+                                        .await;
+                                }
+                            }
+                        }
+
+                        let sse_url = format!("{}/api/awaitserverstatus", base_url(&state));
+                        let mut chosen: Option<LocalNode> = None;
+
+                        for node in &nodes {
+                            let switch_resp = client
+                                .put(format!("{}/api/changenode", base_url(&state)))
+                                .header("Authorization", auth_header(&state))
+                                .json(&ChangeNodeRequest {
+                                    node_id: node.name.clone(),
+                                    server_id: "none".to_string(),
+                                })
+                                .send()
+                                .await;
+
+                            if let Err(e) = switch_resp {
+                                eprintln!("Failed to switch to node '{}': {}", node.name, e);
+                                continue;
+                            }
+
+                            tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+
+                            let sse_resp = client
+                                .get(&sse_url)
+                                .header("Authorization", auth_header(&state))
+                                .send()
+                                .await;
+
+                            let status = match sse_resp {
+                                Ok(mut r) if r.status().is_success() => {
+                                    let mut status_str = String::new();
+                                    let mut event_count = 0;
+                                    'sse: loop {
+                                        match tokio::time::timeout(
+                                            tokio::time::Duration::from_secs(10),
+                                            r.chunk(),
+                                        )
+                                        .await
+                                        {
+                                            Ok(Ok(Some(chunk))) => {
+                                                let text = String::from_utf8_lossy(&chunk);
+                                                for line in text.lines() {
+                                                    if let Some(data) = line.strip_prefix("data:") {
+                                                        event_count += 1;
+                                                        status_str = data.trim().to_string();
+                                                        // wait for at least 2 events so the first stale one is discarded
+                                                        if event_count >= 2 {
+                                                            break 'sse;
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                            _ => break 'sse,
+                                        }
+                                    }
+                                    status_str
+                                }
+                                _ => {
+                                    eprintln!("Failed to read SSE for node '{}'", node.name);
+                                    continue;
+                                }
+                            };
+
+                            if status == "down" || status == "unknown" {
+                                println!("Scheduling to node '{}' (status: {})", node.name, status);
+                                chosen = Some(node.clone());
+                                break;
+                            }
+
+                            println!("Node '{}' reports status '{}', trying next", node.name, status);
+                        }
+
+                        match chosen {
+                            Some(n) => Some(n),
+                            None => {
+                                eprintln!(
+                                    "No available node found (all nodes are up or unreachable)"
+                                );
+                                std::process::exit(1);
+                            }
                         }
                     }
                 };
@@ -358,7 +501,7 @@ async fn main() {
                 let node = match target_node {
                     Some(n) => n,
                     None => {
-                        eprintln!("No local node found for file: {}", args.file);
+                        eprintln!("No local node found for file: {}", file);
                         return;
                     }
                 };
@@ -372,7 +515,7 @@ async fn main() {
                 }
 
                 if FORCE_LOCATION_IN_SERVER {
-                    let in_any_node = nodes.iter().any(|n| args.file.starts_with(&n.path));
+                    let in_any_node = nodes.iter().any(|n| file.starts_with(&n.path));
                     if !in_any_node {
                         eprintln!(
                             "FORCE_LOCATION_IN_SERVER is set: file must be inside a local node server directory. Known paths: {}",
@@ -389,16 +532,8 @@ async fn main() {
                 let server_root = std::fs::canonicalize(std::path::Path::new(&node.path))
                     .unwrap_or_else(|_| std::path::PathBuf::from(&node.path));
 
-                let file_path = std::fs::canonicalize(&args.file)
-                    .unwrap_or_else(|_| std::path::PathBuf::from(&args.file));
-
-                let servername = args.servername.clone().unwrap_or_else(|| {
-                    file_path
-                        .parent()
-                        .and_then(|p| p.file_name())
-                        .map(|n| n.to_string_lossy().to_string())
-                        .unwrap_or_else(|| "server".to_string())
-                });
+                let file_path = std::fs::canonicalize(&file)
+                    .unwrap_or_else(|_| std::path::PathBuf::from(&file));
 
                 let server_location = servername.clone();
 
@@ -417,7 +552,7 @@ async fn main() {
 
                 let provider_config = serde_json::json!({
                     "start": args.start_cmd,
-                    "location": file_name,
+                    "location": if args.file.is_some() { file_name.clone() } else { String::new() },
                     "needed_paths": [],
                     "needed_commands": []
                 });
@@ -433,14 +568,16 @@ async fn main() {
                 println!("Wrote provider.json to {}", provider_json_path.display());
 
                 let file_dest = server_dir.join(&file_name);
-                if file_path != file_dest {
-                    if let Err(e) = std::fs::copy(&args.file, &file_dest) {
-                        eprintln!("Failed to copy file to server directory: {}", e);
-                        return;
+                if args.file.is_some() {
+                    if file_path != file_dest {
+                        if let Err(e) = std::fs::copy(&file, &file_dest) {
+                            eprintln!("Failed to copy file to server directory: {}", e);
+                            return;
+                        }
+                        println!("Copied {} to {}", file, file_dest.display());
+                    } else {
+                        println!("File already in server directory, skipping copy");
                     }
-                    println!("Copied {} to {}", args.file, file_dest.display());
-                } else {
-                    println!("File already in server directory, skipping copy");
                 }
 
                 let servers_response = client
