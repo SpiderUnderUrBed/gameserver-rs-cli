@@ -412,127 +412,152 @@ async fn main() {
                     }
                 },
                 AutoSchedule::ByAvailability => {
-                    let get_settings_resp = client
-                        .get(format!("{}/api/getsettings", base_url(&state)))
-                        .header("Authorization", auth_header(&state))
-                        .send()
-                        .await;
-
-                    if let Ok(r) = get_settings_resp {
-                        if r.status().is_success() {
-                            if let Ok(body) = r.json::<Settings>().await {
-                                let mut updated = serde_json::to_value(&body).unwrap_or_default();
-                                if let Some(obj) = updated.as_object_mut() {
-                                    obj.insert(
-                                        "status_type".to_string(),
-                                        serde_json::json!("server-process"),
-                                    );
-                                }
+                    if let Some(ref name) = args.node {
+                        match nodes.iter().find(|n| &n.name == name).cloned() {
+                            Some(node) => {
                                 let _ = client
-                                    .post(format!("{}/api/setsettings", base_url(&state)))
+                                    .put(format!("{}/api/changenode", base_url(&state)))
                                     .header("Authorization", auth_header(&state))
-                                    .json(&IncomingMessageWithValue {
-                                        message: updated,
-                                        message_type: String::new(),
-                                        authcode: String::new(),
+                                    .json(&ChangeNodeRequest {
+                                        node_id: node.name.clone(),
+                                        server_id: "none".to_string(),
                                     })
                                     .send()
                                     .await;
+                                tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
+                                Some(node)
+                            }
+                            None => {
+                                eprintln!("Node '{}' not found in local_nodes config", name);
+                                return;
                             }
                         }
-                    }
-
-                    let sse_url = format!("{}/api/awaitserverstatus", base_url(&state));
-                    let mut chosen: Option<LocalNode> = None;
-
-                    for node in &nodes {
-                        let switch_resp = client
-                            .put(format!("{}/api/changenode", base_url(&state)))
+                    } else {
+                        let get_settings_resp = client
+                            .get(format!("{}/api/getsettings", base_url(&state)))
                             .header("Authorization", auth_header(&state))
-                            .json(&ChangeNodeRequest {
-                                node_id: node.name.clone(),
-                                server_id: "none".to_string(),
-                            })
                             .send()
                             .await;
 
-                        if let Err(e) = switch_resp {
-                            eprintln!("Failed to switch to node '{}': {}", node.name, e);
-                            continue;
+                        if let Ok(r) = get_settings_resp {
+                            if r.status().is_success() {
+                                if let Ok(body) = r.json::<Settings>().await {
+                                    let mut updated =
+                                        serde_json::to_value(&body).unwrap_or_default();
+                                    if let Some(obj) = updated.as_object_mut() {
+                                        obj.insert(
+                                            "status_type".to_string(),
+                                            serde_json::json!("server-process"),
+                                        );
+                                    }
+                                    let _ = client
+                                        .post(format!("{}/api/setsettings", base_url(&state)))
+                                        .header("Authorization", auth_header(&state))
+                                        .json(&IncomingMessageWithValue {
+                                            message: updated,
+                                            message_type: String::new(),
+                                            authcode: String::new(),
+                                        })
+                                        .send()
+                                        .await;
+                                }
+                            }
                         }
 
-                        tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+                        let sse_url = format!("{}/api/awaitserverstatus", base_url(&state));
+                        let mut chosen: Option<LocalNode> = None;
 
-                        let sse_resp = client
-                            .get(&sse_url)
-                            .header("Authorization", auth_header(&state))
-                            .send()
-                            .await;
+                        for node in &nodes {
+                            let switch_resp = client
+                                .put(format!("{}/api/changenode", base_url(&state)))
+                                .header("Authorization", auth_header(&state))
+                                .json(&ChangeNodeRequest {
+                                    node_id: node.name.clone(),
+                                    server_id: "none".to_string(),
+                                })
+                                .send()
+                                .await;
 
-                        let status = match sse_resp {
-                            Ok(mut r) if r.status().is_success() => {
-                                let mut status_str = String::new();
-                                let mut event_count = 0;
-                                'sse: loop {
-                                    match tokio::time::timeout(
-                                        tokio::time::Duration::from_secs(10),
-                                        r.chunk(),
-                                    )
-                                    .await
-                                    {
-                                        Ok(Ok(Some(chunk))) => {
-                                            let text = String::from_utf8_lossy(&chunk);
-                                            for line in text.lines() {
-                                                if let Some(data) = line.strip_prefix("data:") {
-                                                    event_count += 1;
-                                                    status_str = data.trim().to_string();
-                                                    if event_count >= 2 {
-                                                        break 'sse;
+                            if let Err(e) = switch_resp {
+                                eprintln!("Failed to switch to node '{}': {}", node.name, e);
+                                continue;
+                            }
+
+                            tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+
+                            let sse_resp = client
+                                .get(&sse_url)
+                                .header("Authorization", auth_header(&state))
+                                .send()
+                                .await;
+
+                            let status = match sse_resp {
+                                Ok(mut r) if r.status().is_success() => {
+                                    let mut status_str = String::new();
+                                    let mut event_count = 0;
+                                    'sse: loop {
+                                        match tokio::time::timeout(
+                                            tokio::time::Duration::from_secs(10),
+                                            r.chunk(),
+                                        )
+                                        .await
+                                        {
+                                            Ok(Ok(Some(chunk))) => {
+                                                let text = String::from_utf8_lossy(&chunk);
+                                                for line in text.lines() {
+                                                    if let Some(data) = line.strip_prefix("data:") {
+                                                        event_count += 1;
+                                                        status_str = data.trim().to_string();
+                                                        if event_count >= 2 {
+                                                            break 'sse;
+                                                        }
                                                     }
                                                 }
                                             }
+                                            _ => break 'sse,
                                         }
-                                        _ => break 'sse,
                                     }
+                                    status_str
                                 }
-                                status_str
-                            }
-                            _ => {
-                                eprintln!("Failed to read SSE for node '{}'", node.name);
-                                continue;
-                            }
-                        };
+                                _ => {
+                                    eprintln!("Failed to read SSE for node '{}'", node.name);
+                                    continue;
+                                }
+                            };
 
-                        if status == "down" || status == "unknown" {
-                            println!("Scheduling to node '{}' (status: {})", node.name, status);
-                            chosen = Some(node.clone());
-                            break;
+                            if status == "down" || status == "unknown" {
+                                println!("Scheduling to node '{}' (status: {})", node.name, status);
+                                chosen = Some(node.clone());
+                                break;
+                            }
+
+                            println!(
+                                "Node '{}' reports status '{}', trying next",
+                                node.name, status
+                            );
                         }
 
-                        println!(
-                            "Node '{}' reports status '{}', trying next",
-                            node.name, status
-                        );
-                    }
+                        if let Some(ref chosen_node) = chosen {
+                            let _ = client
+                                .put(format!("{}/api/changenode", base_url(&state)))
+                                .header("Authorization", auth_header(&state))
+                                .json(&ChangeNodeRequest {
+                                    node_id: chosen_node.name.clone(),
+                                    server_id: "none".to_string(),
+                                })
+                                .send()
+                                .await;
+                            tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
+                        }
 
-                    if let Some(ref chosen_node) = chosen {
-                        let _ = client
-                            .put(format!("{}/api/changenode", base_url(&state)))
-                            .header("Authorization", auth_header(&state))
-                            .json(&ChangeNodeRequest {
-                                node_id: chosen_node.name.clone(),
-                                server_id: "none".to_string(),
-                            })
-                            .send()
-                            .await;
-                        tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
-                    }
-
-                    match chosen {
-                        Some(n) => Some(n),
-                        None => {
-                            eprintln!("No available node found (all nodes are up or unreachable)");
-                            std::process::exit(1);
+                        match chosen {
+                            Some(n) => Some(n),
+                            None => {
+                                eprintln!(
+                                    "No available node found (all nodes are up or unreachable)"
+                                );
+                                std::process::exit(1);
+                            }
                         }
                     }
                 }
