@@ -145,6 +145,10 @@ pub struct RunArgs {
     pub no_bindmount: bool,
     #[arg(long, default_value_t = false)]
     pub dry_run: bool,
+    #[arg(long, default_value_t = false)]
+    pub force_recreate: bool,
+    #[arg(long, default_value_t = false)]
+    pub force_reuse: bool,
 }
 
 #[derive(Debug, Subcommand)]
@@ -646,56 +650,167 @@ async fn main() {
                 }
             }
 
-            let _ = client
-                .post(format!("{}/api/deleteserver", base_url(&state)))
-                .header("Authorization", auth_header(&state))
-                .json(&serde_json::json!({
-                    "message": "",
-                    "type": "command",
-                    "authcode": "",
-                    "metadata": {
-                        "kind": "DeleteServer",
-                        "data": {
-                            "delete_server_name": servername,
-                            "delete_server_files": false
+            let force_recreate = args.force_recreate || (!args.force_reuse);
+
+            if force_recreate {
+                let server_status_resp = client
+                    .get(format!("{}/api/awaitserverstatus", base_url(&state)))
+                    .header("Authorization", auth_header(&state))
+                    .send()
+                    .await;
+
+                let is_running = match server_status_resp {
+                    Ok(mut r) if r.status().is_success() => {
+                        let mut status_str = String::new();
+                        'sse_status: loop {
+                            match tokio::time::timeout(
+                                tokio::time::Duration::from_secs(5),
+                                r.chunk(),
+                            )
+                            .await
+                            {
+                                Ok(Ok(Some(chunk))) => {
+                                    let text = String::from_utf8_lossy(&chunk);
+                                    for line in text.lines() {
+                                        if let Some(data) = line.strip_prefix("data:") {
+                                            status_str = data.trim().to_string();
+                                            break 'sse_status;
+                                        }
+                                    }
+                                }
+                                _ => break 'sse_status,
+                            }
+                        }
+                        status_str == "up"
+                    }
+                    _ => false,
+                };
+
+                if is_running {
+                    eprintln!(
+                        "Server '{}' is currently running, skipping recreate (use --force-reuse to reuse or stop the server first)",
+                        servername
+                    );
+                    return;
+                }
+
+                let _ = client
+                    .post(format!("{}/api/deleteserver", base_url(&state)))
+                    .header("Authorization", auth_header(&state))
+                    .json(&serde_json::json!({
+                        "message": "",
+                        "type": "command",
+                        "authcode": "",
+                        "metadata": {
+                            "kind": "DeleteServer",
+                            "data": {
+                                "delete_server_name": servername,
+                                "delete_server_files": false
+                            }
+                        }
+                    }))
+                    .send()
+                    .await;
+
+                let create_response = client
+                    .post(format!("{}/api/addserver", base_url(&state)))
+                    .header("Authorization", auth_header(&state))
+                    .json(&serde_json::json!({
+                        "element": {
+                            "kind": "Server",
+                            "data": {
+                                "servername": servername,
+                                "provider": "custom",
+                                "providertype": "",
+                                "location": server_location,
+                                "sandbox": false,
+                                "server_metadata": {}
+                            }
+                        },
+                        "jwt": "",
+                        "require_auth": false
+                    }))
+                    .send()
+                    .await;
+
+                match create_response {
+                    Ok(r) if r.status().is_success() => {
+                        println!("Server '{}' created", servername);
+                    }
+                    Ok(r) => {
+                        eprintln!("addserver failed: {}", r.status());
+                        return;
+                    }
+                    Err(e) => {
+                        eprintln!("addserver request failed: {}", e);
+                        return;
+                    }
+                }
+            } else {
+                let servers_response = client
+                    .get(format!("{}/api/servers", base_url(&state)))
+                    .header("Authorization", auth_header(&state))
+                    .send()
+                    .await;
+
+                let server_exists = match servers_response {
+                    Ok(r) if r.status().is_success() => match r.json::<serde_json::Value>().await {
+                        Ok(body) => body
+                            .as_array()
+                            .map(|arr| {
+                                arr.iter().any(|s| {
+                                    s.get("servername")
+                                        .and_then(|n| n.as_str())
+                                        .map(|n| n == servername)
+                                        .unwrap_or(false)
+                                })
+                            })
+                            .unwrap_or(false),
+                        Err(_) => false,
+                    },
+                    _ => false,
+                };
+
+                if server_exists {
+                    println!("Server '{}' already exists, reusing it", servername);
+                } else {
+                    let create_response = client
+                        .post(format!("{}/api/addserver", base_url(&state)))
+                        .header("Authorization", auth_header(&state))
+                        .json(&serde_json::json!({
+                            "element": {
+                                "kind": "Server",
+                                "data": {
+                                    "servername": servername,
+                                    "provider": "custom",
+                                    "providertype": "",
+                                    "location": server_location,
+                                    "sandbox": false,
+                                    "server_metadata": {}
+                                }
+                            },
+                            "jwt": "",
+                            "require_auth": false
+                        }))
+                        .send()
+                        .await;
+
+                    match create_response {
+                        Ok(r) if r.status().is_success() => {
+                            println!("Server '{}' created", servername);
+                        }
+                        Ok(r) if r.status() == 409 => {
+                            println!("Server '{}' already exists (409), reusing it", servername);
+                        }
+                        Ok(r) => {
+                            eprintln!("addserver failed: {}", r.status());
+                            return;
+                        }
+                        Err(e) => {
+                            eprintln!("addserver request failed: {}", e);
+                            return;
                         }
                     }
-                }))
-                .send()
-                .await;
-
-            let create_response = client
-                .post(format!("{}/api/addserver", base_url(&state)))
-                .header("Authorization", auth_header(&state))
-                .json(&serde_json::json!({
-                    "element": {
-                        "kind": "Server",
-                        "data": {
-                            "servername": servername,
-                            "provider": "custom",
-                            "providertype": "",
-                            "location": server_location,
-                            "sandbox": false,
-                            "server_metadata": {}
-                        }
-                    },
-                    "jwt": "",
-                    "require_auth": false
-                }))
-                .send()
-                .await;
-
-            match create_response {
-                Ok(r) if r.status().is_success() => {
-                    println!("Server '{}' created", servername);
-                }
-                Ok(r) => {
-                    eprintln!("addserver failed: {}", r.status());
-                    return;
-                }
-                Err(e) => {
-                    eprintln!("addserver request failed: {}", e);
-                    return;
                 }
             }
 
