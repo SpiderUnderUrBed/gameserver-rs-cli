@@ -31,6 +31,7 @@ pub enum AutoSchedule {
 }
 
 static AUTO_SCHEDULE: AutoSchedule = AutoSchedule::ByAvailability;
+static BIND_MOUNT: bool = false;
 static FORCE_LOCATION_IN_SERVER: bool = false;
 static REQUIRE_SERVER_NAME: bool = false;
 static USES_CWD_AS_SERVERNAME: bool = true;
@@ -52,8 +53,7 @@ pub enum Commands {
     Server(ServerCmd),
     CommandSettings(CommandSettingsCmd),
     FsOperation(FsOperationCmd),
-    // #[command(name = "gameserver", next_help_heading = "Presets")]
-    Presets(GameserverCmd),
+    Run(RunArgs),
 }
 
 #[derive(Debug, Args)]
@@ -110,12 +110,6 @@ pub struct UsersCmd {
     pub action: UsersType,
 }
 
-#[derive(Debug, Args)]
-pub struct GameserverCmd {
-    #[clap(subcommand)]
-    pub action: GameserverType,
-}
-
 #[derive(Debug, Subcommand)]
 pub enum FsOperationType {}
 
@@ -137,13 +131,8 @@ pub enum CmdSettingsType {
     Get,
 }
 
-#[derive(Debug, Subcommand)]
-pub enum GameserverType {
-    Run(GameserverRunArgs),
-}
-
 #[derive(Debug, Args)]
-pub struct GameserverRunArgs {
+pub struct RunArgs {
     #[arg(long)]
     pub file: Option<String>,
     #[arg(long)]
@@ -152,6 +141,10 @@ pub struct GameserverRunArgs {
     pub start_cmd: String,
     #[arg(long)]
     pub servername: Option<String>,
+    #[arg(long)]
+    pub no_bindmount: bool,
+    #[arg(long, default_value_t = false)]
+    pub dry_run: bool,
 }
 
 #[derive(Debug, Subcommand)]
@@ -219,6 +212,8 @@ struct CommandSettings {
     auth_token: Option<String>,
     #[arg(long)]
     url: Option<String>,
+    #[arg(long)]
+    user: Option<String>,
     // Decribes the PID of the process not using the gameserver system
     #[arg(long, value_delimiter = ',', help = "comma-separated list of pids")]
     external_process_pid: Option<Vec<String>>,
@@ -245,6 +240,7 @@ impl CommandSettings {
         CommandSettings {
             auth_token: self.auth_token.or(other.auth_token),
             url: self.url.or(other.url),
+            user: self.user.or(other.user),
             external_process_pid: self.external_process_pid.or(other.external_process_pid),
             external_process_systemd: self
                 .external_process_systemd
@@ -253,6 +249,34 @@ impl CommandSettings {
             forward_actions: self.forward_actions.or(other.forward_actions),
             local_nodes: self.local_nodes.or(other.local_nodes),
         }
+    }
+
+    fn resolve_home(&self) -> String {
+        if let Some(ref username) = self.user {
+            let out = std::process::Command::new("getent")
+                .args(["passwd", username])
+                .output()
+                .ok();
+            if let Some(out) = out {
+                if let Ok(line) = String::from_utf8(out.stdout) {
+                    if let Some(home) = line.split(':').nth(5) {
+                        return home.trim().to_string();
+                    }
+                }
+            }
+        }
+
+        std::env::var("SUDO_USER")
+            .ok()
+            .and_then(|u| {
+                let out = std::process::Command::new("getent")
+                    .args(["passwd", &u])
+                    .output()
+                    .ok()?;
+                let line = String::from_utf8(out.stdout).ok()?;
+                line.split(':').nth(5).map(|s| s.trim().to_string())
+            })
+            .unwrap_or_else(|| std::env::var("HOME").unwrap_or_default())
     }
 
     pub fn parsed_local_nodes(&self) -> Vec<LocalNode> {
@@ -278,7 +302,7 @@ impl CommandSettings {
                 };
 
                 let expanded = if raw_path.starts_with("~/") {
-                    let home = std::env::var("HOME").unwrap_or_default();
+                    let home = self.resolve_home();
                     format!("{}/{}", home.trim_end_matches('/'), &raw_path[2..])
                 } else {
                     raw_path.to_string()
@@ -342,347 +366,387 @@ async fn main() {
     state.db = load_db();
 
     match cli.command {
-        Some(Commands::Presets(cmd)) => match cmd.action {
-            GameserverType::Run(args) => {
-                if REQUIRE_SERVER_NAME && args.servername.is_none() && !USES_CWD_AS_SERVERNAME {
-                    eprintln!("--servername is required when REQUIRE_SERVER_NAME is true");
-                    return;
-                }
+        Some(Commands::Run(args)) => {
+            if REQUIRE_SERVER_NAME && args.servername.is_none() && !USES_CWD_AS_SERVERNAME {
+                eprintln!("--servername is required when REQUIRE_SERVER_NAME is true");
+                return;
+            }
 
-                let nodes = state.db.command_settings.parsed_local_nodes();
+            let nodes = state.db.command_settings.parsed_local_nodes();
 
-                let file = args.file.clone().unwrap_or_else(|| {
-                    std::env::current_dir()
-                        .ok()
-                        .map(|p| p.to_string_lossy().to_string())
-                        .unwrap_or_default()
-                });
+            let file = args.file.clone().unwrap_or_else(|| {
+                std::env::current_dir()
+                    .ok()
+                    .map(|p| p.to_string_lossy().to_string())
+                    .unwrap_or_default()
+            });
 
-                let servername = if USES_CWD_AS_SERVERNAME && args.servername.is_none() {
-                    std::env::current_dir()
-                        .ok()
-                        .and_then(|p| p.file_name().map(|n| n.to_string_lossy().to_string()))
+            let servername = if USES_CWD_AS_SERVERNAME && args.servername.is_none() {
+                std::env::current_dir()
+                    .ok()
+                    .and_then(|p| p.file_name().map(|n| n.to_string_lossy().to_string()))
+                    .unwrap_or_else(|| "server".to_string())
+            } else {
+                args.servername.clone().unwrap_or_else(|| {
+                    let file_path = std::fs::canonicalize(&file)
+                        .unwrap_or_else(|_| std::path::PathBuf::from(&file));
+                    file_path
+                        .parent()
+                        .and_then(|p| p.file_name())
+                        .map(|n| n.to_string_lossy().to_string())
                         .unwrap_or_else(|| "server".to_string())
-                } else {
-                    args.servername.clone().unwrap_or_else(|| {
-                        let file_path = std::fs::canonicalize(&file)
-                            .unwrap_or_else(|_| std::path::PathBuf::from(&file));
-                        file_path
-                            .parent()
-                            .and_then(|p| p.file_name())
-                            .map(|n| n.to_string_lossy().to_string())
-                            .unwrap_or_else(|| "server".to_string())
-                    })
-                };
+                })
+            };
 
-                let target_node = match &AUTO_SCHEDULE {
-                    AutoSchedule::ByPath => find_node_for_path(&nodes, &file).cloned(),
-                    AutoSchedule::Manual => match &args.node {
-                        Some(name) => nodes.iter().find(|n| &n.name == name).cloned(),
-                        None => {
-                            eprintln!("--node is required when AUTO_SCHEDULE is Manual");
-                            return;
+            let target_node = match &AUTO_SCHEDULE {
+                AutoSchedule::ByPath => find_node_for_path(&nodes, &file).cloned(),
+                AutoSchedule::Manual => match &args.node {
+                    Some(name) => nodes.iter().find(|n| &n.name == name).cloned(),
+                    None => {
+                        eprintln!("--node is required when AUTO_SCHEDULE is Manual");
+                        return;
+                    }
+                },
+                AutoSchedule::ByAvailability => {
+                    let get_settings_resp = client
+                        .get(format!("{}/api/getsettings", base_url(&state)))
+                        .header("Authorization", auth_header(&state))
+                        .send()
+                        .await;
+
+                    if let Ok(r) = get_settings_resp {
+                        if r.status().is_success() {
+                            if let Ok(body) = r.json::<Settings>().await {
+                                let mut updated = serde_json::to_value(&body).unwrap_or_default();
+                                if let Some(obj) = updated.as_object_mut() {
+                                    obj.insert(
+                                        "status_type".to_string(),
+                                        serde_json::json!("server-process"),
+                                    );
+                                }
+                                let _ = client
+                                    .post(format!("{}/api/setsettings", base_url(&state)))
+                                    .header("Authorization", auth_header(&state))
+                                    .json(&IncomingMessageWithValue {
+                                        message: updated,
+                                        message_type: String::new(),
+                                        authcode: String::new(),
+                                    })
+                                    .send()
+                                    .await;
+                            }
                         }
-                    },
-                    AutoSchedule::ByAvailability => {
-                        let get_settings_resp = client
-                            .get(format!("{}/api/getsettings", base_url(&state)))
+                    }
+
+                    let sse_url = format!("{}/api/awaitserverstatus", base_url(&state));
+                    let mut chosen: Option<LocalNode> = None;
+
+                    for node in &nodes {
+                        let switch_resp = client
+                            .put(format!("{}/api/changenode", base_url(&state)))
+                            .header("Authorization", auth_header(&state))
+                            .json(&ChangeNodeRequest {
+                                node_id: node.name.clone(),
+                                server_id: "none".to_string(),
+                            })
+                            .send()
+                            .await;
+
+                        if let Err(e) = switch_resp {
+                            eprintln!("Failed to switch to node '{}': {}", node.name, e);
+                            continue;
+                        }
+
+                        tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+
+                        let sse_resp = client
+                            .get(&sse_url)
                             .header("Authorization", auth_header(&state))
                             .send()
                             .await;
 
-                        if let Ok(r) = get_settings_resp {
-                            if r.status().is_success() {
-                                if let Ok(body) = r.json::<Settings>().await {
-                                    let mut updated = serde_json::to_value(&body).unwrap_or_default();
-                                    if let Some(obj) = updated.as_object_mut() {
-                                        obj.insert(
-                                            "status_type".to_string(),
-                                            serde_json::json!("server-process"),
-                                        );
-                                    }
-                                    let _ = client
-                                        .post(format!("{}/api/setsettings", base_url(&state)))
-                                        .header("Authorization", auth_header(&state))
-                                        .json(&IncomingMessageWithValue {
-                                            message: updated,
-                                            message_type: String::new(),
-                                            authcode: String::new(),
-                                        })
-                                        .send()
-                                        .await;
-                                }
-                            }
-                        }
-
-                        let sse_url = format!("{}/api/awaitserverstatus", base_url(&state));
-                        let mut chosen: Option<LocalNode> = None;
-
-                        for node in &nodes {
-                            let switch_resp = client
-                                .put(format!("{}/api/changenode", base_url(&state)))
-                                .header("Authorization", auth_header(&state))
-                                .json(&ChangeNodeRequest {
-                                    node_id: node.name.clone(),
-                                    server_id: "none".to_string(),
-                                })
-                                .send()
-                                .await;
-
-                            if let Err(e) = switch_resp {
-                                eprintln!("Failed to switch to node '{}': {}", node.name, e);
-                                continue;
-                            }
-
-                            tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
-
-                            let sse_resp = client
-                                .get(&sse_url)
-                                .header("Authorization", auth_header(&state))
-                                .send()
-                                .await;
-
-                            let status = match sse_resp {
-                                Ok(mut r) if r.status().is_success() => {
-                                    let mut status_str = String::new();
-                                    let mut event_count = 0;
-                                    'sse: loop {
-                                        match tokio::time::timeout(
-                                            tokio::time::Duration::from_secs(10),
-                                            r.chunk(),
-                                        )
-                                        .await
-                                        {
-                                            Ok(Ok(Some(chunk))) => {
-                                                let text = String::from_utf8_lossy(&chunk);
-                                                for line in text.lines() {
-                                                    if let Some(data) = line.strip_prefix("data:") {
-                                                        event_count += 1;
-                                                        status_str = data.trim().to_string();
-                                                        // wait for at least 2 events so the first stale one is discarded
-                                                        if event_count >= 2 {
-                                                            break 'sse;
-                                                        }
+                        let status = match sse_resp {
+                            Ok(mut r) if r.status().is_success() => {
+                                let mut status_str = String::new();
+                                let mut event_count = 0;
+                                'sse: loop {
+                                    match tokio::time::timeout(
+                                        tokio::time::Duration::from_secs(10),
+                                        r.chunk(),
+                                    )
+                                    .await
+                                    {
+                                        Ok(Ok(Some(chunk))) => {
+                                            let text = String::from_utf8_lossy(&chunk);
+                                            for line in text.lines() {
+                                                if let Some(data) = line.strip_prefix("data:") {
+                                                    event_count += 1;
+                                                    status_str = data.trim().to_string();
+                                                    if event_count >= 2 {
+                                                        break 'sse;
                                                     }
                                                 }
                                             }
-                                            _ => break 'sse,
                                         }
+                                        _ => break 'sse,
                                     }
-                                    status_str
                                 }
-                                _ => {
-                                    eprintln!("Failed to read SSE for node '{}'", node.name);
-                                    continue;
-                                }
-                            };
-
-                            if status == "down" || status == "unknown" {
-                                println!("Scheduling to node '{}' (status: {})", node.name, status);
-                                chosen = Some(node.clone());
-                                break;
+                                status_str
                             }
+                            _ => {
+                                eprintln!("Failed to read SSE for node '{}'", node.name);
+                                continue;
+                            }
+                        };
 
-                            println!("Node '{}' reports status '{}', trying next", node.name, status);
+                        if status == "down" || status == "unknown" {
+                            println!("Scheduling to node '{}' (status: {})", node.name, status);
+                            chosen = Some(node.clone());
+                            break;
                         }
 
-                        match chosen {
-                            Some(n) => Some(n),
-                            None => {
-                                eprintln!(
-                                    "No available node found (all nodes are up or unreachable)"
-                                );
-                                std::process::exit(1);
-                            }
+                        println!(
+                            "Node '{}' reports status '{}', trying next",
+                            node.name, status
+                        );
+                    }
+
+                    if let Some(ref chosen_node) = chosen {
+                        let _ = client
+                            .put(format!("{}/api/changenode", base_url(&state)))
+                            .header("Authorization", auth_header(&state))
+                            .json(&ChangeNodeRequest {
+                                node_id: chosen_node.name.clone(),
+                                server_id: "none".to_string(),
+                            })
+                            .send()
+                            .await;
+                        tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
+                    }
+
+                    match chosen {
+                        Some(n) => Some(n),
+                        None => {
+                            eprintln!("No available node found (all nodes are up or unreachable)");
+                            std::process::exit(1);
                         }
                     }
-                };
+                }
+            };
 
-                let node = match target_node {
-                    Some(n) => n,
-                    None => {
-                        eprintln!("No local node found for file: {}", file);
-                        return;
-                    }
-                };
+            let node = match target_node {
+                Some(n) => n,
+                None => {
+                    eprintln!("No local node found for file: {}", file);
+                    return;
+                }
+            };
 
-                if !matches!(node.node_type, LocalNodeType::Local) {
+            if !matches!(node.node_type, LocalNodeType::Local) {
+                eprintln!(
+                    "Node '{}' is not a local node. Only local nodes are supported for run.",
+                    node.name
+                );
+                return;
+            }
+
+            if FORCE_LOCATION_IN_SERVER {
+                let in_any_node = nodes.iter().any(|n| file.starts_with(&n.path));
+                if !in_any_node {
                     eprintln!(
-                        "Node '{}' is not a local node. Only local nodes are supported for presets run.",
-                        node.name
+                        "FORCE_LOCATION_IN_SERVER is set: file must be inside a local node server directory. Known paths: {}",
+                        nodes
+                            .iter()
+                            .map(|n| n.path.as_str())
+                            .collect::<Vec<_>>()
+                            .join(", ")
                     );
                     return;
                 }
+            }
 
-                if FORCE_LOCATION_IN_SERVER {
-                    let in_any_node = nodes.iter().any(|n| file.starts_with(&n.path));
-                    if !in_any_node {
-                        eprintln!(
-                            "FORCE_LOCATION_IN_SERVER is set: file must be inside a local node server directory. Known paths: {}",
-                            nodes
-                                .iter()
-                                .map(|n| n.path.as_str())
-                                .collect::<Vec<_>>()
-                                .join(", ")
-                        );
+            let server_root = std::fs::canonicalize(std::path::Path::new(&node.path))
+                .unwrap_or_else(|_| std::path::PathBuf::from(&node.path));
+
+            let file_path =
+                std::fs::canonicalize(&file).unwrap_or_else(|_| std::path::PathBuf::from(&file));
+
+            let server_location = servername.clone();
+
+            let file_name = file_path
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .to_string();
+
+            let server_dir = server_root.join(&server_location);
+
+            if let Err(e) = std::fs::create_dir_all(&server_dir) {
+                eprintln!("Failed to create server directory: {}", e);
+                return;
+            }
+
+            let provider_config = serde_json::json!({
+                "start": args.start_cmd,
+                "location": if args.file.is_some() { file_name.clone() } else { String::new() },
+                "needed_paths": [],
+                "needed_commands": []
+            });
+
+            let provider_json_path = server_dir.join("provider.json");
+            if let Err(e) = std::fs::write(
+                &provider_json_path,
+                serde_json::to_string_pretty(&provider_config).unwrap(),
+            ) {
+                eprintln!("Failed to write provider.json: {}", e);
+                return;
+            }
+            println!("Wrote provider.json to {}", provider_json_path.display());
+
+            let file_dest = server_dir.join(&file_name);
+            if args.file.is_some() {
+                if file_path != file_dest {
+                    if let Err(e) = std::fs::copy(&file, &file_dest) {
+                        eprintln!("Failed to copy file to server directory: {}", e);
                         return;
                     }
-                }
-
-                let server_root = std::fs::canonicalize(std::path::Path::new(&node.path))
-                    .unwrap_or_else(|_| std::path::PathBuf::from(&node.path));
-
-                let file_path = std::fs::canonicalize(&file)
-                    .unwrap_or_else(|_| std::path::PathBuf::from(&file));
-
-                let server_location = servername.clone();
-
-                let file_name = file_path
-                    .file_name()
-                    .unwrap_or_default()
-                    .to_string_lossy()
-                    .to_string();
-
-                let server_dir = server_root.join(&server_location);
-
-                if let Err(e) = std::fs::create_dir_all(&server_dir) {
-                    eprintln!("Failed to create server directory: {}", e);
-                    return;
-                }
-
-                let provider_config = serde_json::json!({
-                    "start": args.start_cmd,
-                    "location": if args.file.is_some() { file_name.clone() } else { String::new() },
-                    "needed_paths": [],
-                    "needed_commands": []
-                });
-
-                let provider_json_path = server_dir.join("provider.json");
-                if let Err(e) = std::fs::write(
-                    &provider_json_path,
-                    serde_json::to_string_pretty(&provider_config).unwrap(),
-                ) {
-                    eprintln!("Failed to write provider.json: {}", e);
-                    return;
-                }
-                println!("Wrote provider.json to {}", provider_json_path.display());
-
-                let file_dest = server_dir.join(&file_name);
-                if args.file.is_some() {
-                    if file_path != file_dest {
-                        if let Err(e) = std::fs::copy(&file, &file_dest) {
-                            eprintln!("Failed to copy file to server directory: {}", e);
-                            return;
-                        }
-                        println!("Copied {} to {}", file, file_dest.display());
-                    } else {
-                        println!("File already in server directory, skipping copy");
-                    }
-                }
-
-                let servers_response = client
-                    .get(format!("{}/api/servers", base_url(&state)))
-                    .header("Authorization", auth_header(&state))
-                    .send()
-                    .await;
-
-                let server_exists = match servers_response {
-                    Ok(r) if r.status().is_success() => match r.json::<serde_json::Value>().await {
-                        Ok(body) => body
-                            .as_array()
-                            .map(|arr| {
-                                arr.iter().any(|s| {
-                                    s.get("servername")
-                                        .and_then(|n| n.as_str())
-                                        .map(|n| n == servername)
-                                        .unwrap_or(false)
-                                })
-                            })
-                            .unwrap_or(false),
-                        Err(_) => false,
-                    },
-                    _ => false,
-                };
-
-                if server_exists {
-                    println!("Server '{}' already exists, reusing it", servername);
+                    println!("Copied {} to {}", file, file_dest.display());
                 } else {
-                    let create_response = client
-                        .post(format!("{}/api/addserver", base_url(&state)))
-                        .header("Authorization", auth_header(&state))
-                        .json(&serde_json::json!({
-                            "element": {
-                                "kind": "Server",
-                                "data": {
-                                    "servername": servername,
-                                    "provider": "custom",
-                                    "providertype": "",
-                                    "location": server_location,
-                                    "sandbox": false,
-                                    "server_metadata": {}
-                                }
-                            },
-                            "jwt": "",
-                            "require_auth": false
-                        }))
-                        .send()
-                        .await;
-
-                    match create_response {
-                        Ok(r) if r.status().is_success() => {}
-                        Ok(r) if r.status() == 409 => {
-                            println!("Server '{}' already exists (409), reusing it", servername);
-                        }
-                        Ok(r) => {
-                            eprintln!("addserver failed: {}", r.status());
-                            return;
-                        }
-                        Err(e) => {
-                            eprintln!("addserver request failed: {}", e);
-                            return;
-                        }
-                    }
+                    println!("File already in server directory, skipping copy");
                 }
+            }
 
-                let set_response = client
-                    .post(format!("{}/api/setserver", base_url(&state)))
-                    .header("Authorization", auth_header(&state))
-                    .json(&serde_json::json!({
-                        "element": {
-                            "kind": "String",
-                            "data": servername
-                        },
-                        "jwt": "",
-                        "require_auth": false
-                    }))
-                    .send()
-                    .await;
-
-                match set_response {
-                    Ok(r) if r.status().is_success() => {}
-                    Ok(r) => {
-                        eprintln!("setserver failed: {}", r.status());
+            if BIND_MOUNT && !args.no_bindmount {
+                let cwd = match std::env::current_dir() {
+                    Ok(p) => p,
+                    Err(e) => {
+                        eprintln!("Failed to get current directory for bind mount: {}", e);
+                        return;
+                    }
+                };
+                let status = std::process::Command::new("mount")
+                    .args([
+                        "--bind",
+                        &cwd.to_string_lossy(),
+                        &server_dir.to_string_lossy(),
+                    ])
+                    .status();
+                match status {
+                    Ok(s) if s.success() => {
+                        println!("Bind-mounted {} to {}", cwd.display(), server_dir.display());
+                    }
+                    Ok(s) => {
+                        eprintln!("mount --bind exited with status: {}", s);
                         return;
                     }
                     Err(e) => {
-                        eprintln!("setserver request failed: {}", e);
+                        eprintln!("Failed to run mount --bind: {}", e);
                         return;
                     }
                 }
+            }
 
-                let start_response = client
-                    .post(format!("{}/api/startserver", base_url(&state)))
-                    .header("Authorization", auth_header(&state))
-                    .send()
-                    .await;
+            let _ = client
+                .post(format!("{}/api/deleteserver", base_url(&state)))
+                .header("Authorization", auth_header(&state))
+                .json(&serde_json::json!({
+                    "message": "",
+                    "type": "command",
+                    "authcode": "",
+                    "metadata": {
+                        "kind": "DeleteServer",
+                        "data": {
+                            "delete_server_name": servername,
+                            "delete_server_files": false
+                        }
+                    }
+                }))
+                .send()
+                .await;
 
-                match start_response {
-                    Ok(r) if r.status().is_success() => println!("Server started"),
-                    Ok(r) => eprintln!("startserver failed: {}", r.status()),
-                    Err(e) => eprintln!("startserver request failed: {}", e),
+            let create_response = client
+                .post(format!("{}/api/addserver", base_url(&state)))
+                .header("Authorization", auth_header(&state))
+                .json(&serde_json::json!({
+                    "element": {
+                        "kind": "Server",
+                        "data": {
+                            "servername": servername,
+                            "provider": "custom",
+                            "providertype": "",
+                            "location": server_location,
+                            "sandbox": false,
+                            "server_metadata": {}
+                        }
+                    },
+                    "jwt": "",
+                    "require_auth": false
+                }))
+                .send()
+                .await;
+
+            match create_response {
+                Ok(r) if r.status().is_success() => {
+                    println!("Server '{}' created", servername);
+                }
+                Ok(r) => {
+                    eprintln!("addserver failed: {}", r.status());
+                    return;
+                }
+                Err(e) => {
+                    eprintln!("addserver request failed: {}", e);
+                    return;
                 }
             }
-        },
+
+            let set_response = client
+                .post(format!("{}/api/setserver", base_url(&state)))
+                .header("Authorization", auth_header(&state))
+                .json(&serde_json::json!({
+                    "element": {
+                        "kind": "String",
+                        "data": servername
+                    },
+                    "jwt": "",
+                    "require_auth": false
+                }))
+                .send()
+                .await;
+
+            match set_response {
+                Ok(r) if r.status().is_success() => {}
+                Ok(r) => {
+                    eprintln!("setserver failed: {}", r.status());
+                    return;
+                }
+                Err(e) => {
+                    eprintln!("setserver request failed: {}", e);
+                    return;
+                }
+            }
+
+            tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+
+            if args.dry_run {
+                println!("Dry run complete. Would start server '{}'", servername);
+                println!("  provider.json: {}", provider_json_path.display());
+                println!("  node: {}", node.name);
+                println!("  start cmd: {}", args.start_cmd);
+                return;
+            }
+
+            let start_response = client
+                .post(format!("{}/api/startserver", base_url(&state)))
+                .header("Authorization", auth_header(&state))
+                .send()
+                .await;
+
+            match start_response {
+                Ok(r) if r.status().is_success() => println!("Server started"),
+                Ok(r) => eprintln!("startserver failed: {}", r.status()),
+                Err(e) => eprintln!("startserver request failed: {}", e),
+            }
+        }
         Some(Commands::Settings(cmd)) => match cmd.action {
             SettingsType::Set(args) => {
                 let response = client
