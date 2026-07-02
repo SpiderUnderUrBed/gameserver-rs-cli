@@ -621,6 +621,36 @@ async fn main() {
                 return;
             }
 
+            if BIND_MOUNT && !args.no_bindmount {
+                let cwd = match std::env::current_dir() {
+                    Ok(p) => p,
+                    Err(e) => {
+                        eprintln!("Failed to get current directory for bind mount: {}", e);
+                        return;
+                    }
+                };
+                let status = std::process::Command::new("mount")
+                    .args([
+                        "--bind",
+                        &cwd.to_string_lossy(),
+                        &server_dir.to_string_lossy(),
+                    ])
+                    .status();
+                match status {
+                    Ok(s) if s.success() => {
+                        println!("Bind-mounted {} to {}", cwd.display(), server_dir.display());
+                    }
+                    Ok(s) => {
+                        eprintln!("mount --bind exited with status: {}", s);
+                        return;
+                    }
+                    Err(e) => {
+                        eprintln!("Failed to run mount --bind: {}", e);
+                        return;
+                    }
+                }
+            }
+
             let provider_config = serde_json::json!({
                 "start": args.start_cmd,
                 "location": if args.file.is_some() { file_name.clone() } else { String::new() },
@@ -651,35 +681,6 @@ async fn main() {
                 }
             }
 
-            if BIND_MOUNT && !args.no_bindmount {
-                let cwd = match std::env::current_dir() {
-                    Ok(p) => p,
-                    Err(e) => {
-                        eprintln!("Failed to get current directory for bind mount: {}", e);
-                        return;
-                    }
-                };
-                let status = std::process::Command::new("mount")
-                    .args([
-                        "--bind",
-                        &cwd.to_string_lossy(),
-                        &server_dir.to_string_lossy(),
-                    ])
-                    .status();
-                match status {
-                    Ok(s) if s.success() => {
-                        println!("Bind-mounted {} to {}", cwd.display(), server_dir.display());
-                    }
-                    Ok(s) => {
-                        eprintln!("mount --bind exited with status: {}", s);
-                        return;
-                    }
-                    Err(e) => {
-                        eprintln!("Failed to run mount --bind: {}", e);
-                        return;
-                    }
-                }
-            }
 
             let force_recreate = args.force_recreate || (!args.force_reuse);
 
