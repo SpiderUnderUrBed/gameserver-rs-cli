@@ -41,6 +41,8 @@ static USES_CWD_AS_SERVERNAME: bool = true;
 struct Main {
     #[clap(subcommand)]
     pub command: Option<Commands>,
+    #[arg(long, global = true)]
+    pub database: Option<String>,
 }
 
 #[derive(Debug, Subcommand)]
@@ -334,6 +336,7 @@ impl CommandSettings {
 #[derive(Default)]
 struct AppState {
     db: Database,
+    db_path: Option<String>,
 }
 
 fn base_url(state: &AppState) -> String {
@@ -366,8 +369,11 @@ async fn main() {
     let cli = Main::parse();
     let client = Client::new();
     let mut state = AppState::default();
-    let _ = ensure_db();
-    state.db = load_db();
+    // let _ = ensure_db();
+    // state.db = load_db();
+    state.db_path = cli.database.clone();
+    let _ = ensure_db(state.db_path.as_deref());
+    state.db = load_db(state.db_path.as_deref());
 
     match cli.command {
         Some(Commands::Run(args)) => {
@@ -1207,7 +1213,7 @@ async fn main() {
         Some(Commands::CommandSettings(cmd)) => match cmd.action {
             CmdSettingsType::Set(command_settings) => {
                 state.db.command_settings = command_settings.merge(state.db.command_settings);
-                save_db(&state.db);
+                save_db(&state.db, state.db_path.as_deref());
             }
             CmdSettingsType::Get => {
                 println!(
