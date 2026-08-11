@@ -17,7 +17,7 @@ use tokio_tungstenite::{
 
 use crate::{
     databasespec::{Database, LocalNode, LocalNodeType},
-    gameserverspec::{Node, NodeArgs, RetrieveElement, Server, ServerArgs, SettingsArgs, UserArgs},
+    gameserverspec::{Node, NodeArgs, RetrieveElement, Server, ServerArgs, SettingsArgs, UserCreateArgs, UserDeleteArgs},
     jsondatabase::{ensure_db, load_db, save_db},
     types::{ChangeNodeRequest, IncomingMessage, IncomingMessageWithValue},
 };
@@ -191,8 +191,9 @@ pub enum SettingsType {
 
 #[derive(Debug, Subcommand)]
 pub enum UsersType {
-    Create(UserArgs),
+    Create(UserCreateArgs),
     Get,
+    Delete(UserDeleteArgs)
 }
 
 #[derive(Debug, Args)]
@@ -967,7 +968,33 @@ async fn main() {
                 } else {
                     eprintln!("request failed: {}", response.status());
                 }
-            }
+            },
+            UsersType::Delete(user_args) => {
+                let user_perms: Vec<String> = vec![];
+                let response = client
+                    .post(format!("{}/api/deleteuser", base_url(&state)))
+                    .header("Authorization", auth_header(&state))
+                    .json(&serde_json::json!({
+                        "element": {
+                            "kind": "User",
+                            "data": {
+                                "user": user_args.username,
+                                "password": "".to_string(),
+                                "user_perms": user_perms
+                            }
+                        },
+                        "jwt": "",
+                        "require_auth": false
+                    }))
+                    .send()
+                    .await
+                    .unwrap();
+                if response.status().is_success() {
+                    println!("User deleted successfully");
+                } else {
+                    eprintln!("request failed: {}", response.status());
+                }
+            },  
             UsersType::Create(user_args) => {
                 let user = user_args.into_user();
                 let response = client

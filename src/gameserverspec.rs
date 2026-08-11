@@ -242,7 +242,13 @@ pub struct User {
 }
 
 #[derive(Args, Debug)]
-pub struct UserArgs {
+pub struct UserDeleteArgs {
+    #[arg(long)]
+    pub username: String,
+}
+
+#[derive(Args, Debug)]
+pub struct UserCreateArgs {
     #[arg(long)]
     pub username: Option<String>,
     #[arg(long)]
@@ -255,7 +261,7 @@ pub struct UserArgs {
     pub user_perms: Option<Vec<UserPerm>>,
 }
 
-impl UserArgs {
+impl UserCreateArgs {
     pub fn into_user(self) -> User {
         User {
             username: self.username.unwrap_or_default(),
