@@ -1001,16 +1001,9 @@ async fn main() {
                     .post(format!("{}/api/createuser", base_url(&state)))
                     .header("Authorization", auth_header(&state))
                     .json(&serde_json::json!({
-                        "element": {
-                            "kind": "User",
-                            "data": {
-                                "user": user.username,
-                                "password": user.password_hash.unwrap_or_default(),
-                                "user_perms": user.user_perms
-                            }
-                        },
-                        "jwt": "",
-                        "require_auth": false
+                        "user": user.username,
+                        "password": user.password_hash.unwrap_or_default(),
+                        "user_perms": user.user_perms
                     }))
                     .send()
                     .await
