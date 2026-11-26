@@ -17,7 +17,7 @@ use tokio_tungstenite::{
 
 use crate::{
     databasespec::{Database, LocalNode, LocalNodeType},
-    gameserverspec::{Node, NodeArgs, RetrieveElement, Server, ServerArgs, SettingsArgs, UserCreateArgs, UserDeleteArgs},
+    gameserverspec::{Node, NodeArgs, RetrieveElement, Server, ServerArgs, SettingsArgs, UserCreateArgs, UserDeleteArgs, UserSettings},
     jsondatabase::{ensure_db, load_db, save_db},
     types::{ChangeNodeRequest, IncomingMessage, IncomingMessageWithValue},
 };
@@ -980,7 +980,8 @@ async fn main() {
                             "data": {
                                 "user": user_args.username,
                                 "password": "".to_string(),
-                                "user_perms": user_perms
+                                "user_perms": user_perms,
+                                "settings": UserSettings::default()
                             }
                         },
                         "jwt": "",

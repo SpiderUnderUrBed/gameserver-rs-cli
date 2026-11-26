@@ -241,6 +241,26 @@ pub struct User {
     pub user_perms: Vec<UserPerm>,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct UserSettings {
+    pub enable_stats_on_homepage: bool,
+    pub enable_nodes_on_homepage: bool,
+    pub enable_console_entry_on: String,
+    pub show_server_console_running_dialog: String,
+    pub status_type: String
+}
+impl Default for UserSettings {
+    fn default() -> Self {
+        Self { 
+            enable_stats_on_homepage: false, 
+            enable_nodes_on_homepage: false, 
+            enable_console_entry_on: "top".to_string(), 
+            show_server_console_running_dialog: "all".to_string(),
+            status_type: "server-process".to_string()
+        }
+    }
+}
+
 #[derive(Args, Debug)]
 pub struct UserDeleteArgs {
     #[arg(long)]
